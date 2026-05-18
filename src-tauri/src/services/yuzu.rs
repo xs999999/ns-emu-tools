@@ -26,7 +26,6 @@ use std::process::{Command, Stdio};
 #[cfg(not(target_os = "macos"))]
 use std::time::Duration;
 use tracing::{debug, info, warn};
-#[cfg(not(target_os = "macos"))]
 use uuid::Uuid;
 
 /// 支持的模拟器可执行文件/应用列表
@@ -590,20 +589,33 @@ where
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn ensure_citron_bundle_name(installed_app: &Path) -> AppResult<()> {
+fn normalize_citron_bundle_name(installed_app: &Path) -> AppResult<PathBuf> {
     let bundle_name = installed_app
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| AppError::Extract("无法获取 Citron .app 名称".to_string()))?;
 
-    if bundle_name != "Citron.app" {
+    if bundle_name == "Citron.app" {
+        return Ok(installed_app.to_path_buf());
+    }
+
+    if !bundle_name.eq_ignore_ascii_case("Citron.app") {
         return Err(AppError::Extract(format!(
             "Citron DMG 中的应用名称为 {}，期望 Citron.app",
             bundle_name
         )));
     }
 
-    Ok(())
+    let parent_dir = installed_app
+        .parent()
+        .ok_or_else(|| AppError::Extract("无法获取 Citron .app 父目录".to_string()))?;
+    let normalized_app = parent_dir.join("Citron.app");
+    let temp_app = parent_dir.join(format!(".citron-rename-{}.app", Uuid::new_v4()));
+
+    std::fs::rename(installed_app, &temp_app)?;
+    std::fs::rename(&temp_app, &normalized_app)?;
+
+    Ok(normalized_app)
 }
 
 #[cfg(target_os = "macos")]
@@ -639,18 +651,21 @@ where
         }
     };
 
-    if let Err(error) = ensure_citron_bundle_name(&installed_app) {
-        emit_step(
-            &on_event,
-            error_step(
-                STEP_EXTRACT,
-                TITLE_EXTRACT,
-                StepKind::Normal,
-                error.to_string(),
-            ),
-        );
-        return Err(error);
-    }
+    let installed_app = match normalize_citron_bundle_name(&installed_app) {
+        Ok(installed_app) => installed_app,
+        Err(error) => {
+            emit_step(
+                &on_event,
+                error_step(
+                    STEP_EXTRACT,
+                    TITLE_EXTRACT,
+                    StepKind::Normal,
+                    error.to_string(),
+                ),
+            );
+            return Err(error);
+        }
+    };
 
     emit_step(&on_event, success_step(STEP_EXTRACT, TITLE_EXTRACT));
     emit_step(&on_event, running_step(STEP_INSTALL, TITLE_INSTALL));
@@ -2540,13 +2555,35 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_citron_bundle_name() {
+    fn test_normalize_citron_bundle_name_accepts_expected_name() {
         let dir = tempdir().unwrap();
         let citron_app = dir.path().join("Citron.app");
-        let wrong_app = dir.path().join("Eden.app");
+        std::fs::create_dir_all(&citron_app).unwrap();
 
-        ensure_citron_bundle_name(&citron_app).unwrap();
-        let error = ensure_citron_bundle_name(&wrong_app).unwrap_err();
+        let normalized = normalize_citron_bundle_name(&citron_app).unwrap();
+        assert_eq!(normalized, citron_app);
+    }
+
+    #[test]
+    fn test_normalize_citron_bundle_name_renames_case_mismatch() {
+        let dir = tempdir().unwrap();
+        let lower_case_app = dir.path().join("citron.app");
+        let normalized_app = dir.path().join("Citron.app");
+        std::fs::create_dir_all(&lower_case_app).unwrap();
+
+        let normalized = normalize_citron_bundle_name(&lower_case_app).unwrap();
+        assert_eq!(normalized, normalized_app);
+        assert!(normalized.exists());
+        assert!(!lower_case_app.exists());
+    }
+
+    #[test]
+    fn test_normalize_citron_bundle_name_rejects_wrong_app() {
+        let dir = tempdir().unwrap();
+        let wrong_app = dir.path().join("Eden.app");
+        std::fs::create_dir_all(&wrong_app).unwrap();
+
+        let error = normalize_citron_bundle_name(&wrong_app).unwrap_err();
         assert!(matches!(error, AppError::Extract(_)));
         assert!(error.to_string().contains("Citron.app"));
     }
