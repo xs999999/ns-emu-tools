@@ -7,9 +7,11 @@ pub mod progress;
 pub mod release;
 pub mod response;
 pub mod storage;
+pub mod yuzu_branch;
 
 pub use cheats::*;
 pub use progress::*;
 pub use release::*;
 pub use response::*;
 pub use storage::*;
+pub use yuzu_branch::*;

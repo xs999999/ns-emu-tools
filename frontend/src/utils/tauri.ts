@@ -461,8 +461,8 @@ export async function updateYuzuPath(newPath: string) {
 }
 
 /** 获取 Yuzu 变更日志 */
-export async function getYuzuChangeLogs() {
-  return invokeCommand<ApiResponse<string>>('get_yuzu_change_logs_command')
+export async function getYuzuChangeLogs(branch?: string) {
+  return invokeCommand<ApiResponse<string>>('get_yuzu_change_logs_command', { branch })
 }
 
 /** 安装固件到 Yuzu */

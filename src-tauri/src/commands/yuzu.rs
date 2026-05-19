@@ -15,6 +15,7 @@ use tracing::{error, info};
 /// 获取所有 Yuzu/Eden 版本列表
 #[tauri::command]
 pub async fn get_all_yuzu_versions(branch: String) -> Result<ApiResponse<Vec<String>>, String> {
+    let branch = normalize_yuzu_branch_for_config(&branch);
     info!("获取 {} 所有版本", get_emu_name(&branch));
 
     match get_yuzu_all_release_info(&branch).await {
@@ -36,6 +37,7 @@ pub async fn install_yuzu_by_version(
     branch: String,
     window: Window,
 ) -> Result<ApiResponse<()>, String> {
+    let branch = normalize_yuzu_branch_for_config(&branch);
     info!("安装 {} 版本: {}", get_emu_name(&branch), target_version);
     let reporter = InstallReporter::from_window(window.clone());
     reporter.start(install_steps(format!("下载 {}", get_emu_name(&branch))));
@@ -222,10 +224,18 @@ pub fn update_yuzu_path_command(new_path: String) -> Result<ApiResponse<()>, Str
 
 /// 获取 Yuzu 变更日志
 #[tauri::command]
-pub async fn get_yuzu_change_logs_command() -> Result<ApiResponse<String>, String> {
+pub async fn get_yuzu_change_logs_command(
+    branch: Option<String>,
+) -> Result<ApiResponse<String>, String> {
+    let branch = branch.map(|value| normalize_yuzu_branch_for_config(&value));
     info!("获取 Yuzu 变更日志");
 
-    match get_yuzu_change_logs().await {
+    let result = match branch {
+        Some(branch) => get_yuzu_change_logs_for_branch(&branch).await,
+        None => get_yuzu_change_logs().await,
+    };
+
+    match result {
         Ok(changelog) => Ok(ApiResponse::success(changelog)),
         Err(e) => {
             error!("获取变更日志失败: {}", e);
@@ -299,6 +309,7 @@ pub async fn install_firmware_to_yuzu_command(
 #[tauri::command]
 pub fn switch_yuzu_branch(branch: String) -> Result<ApiResponse<()>, String> {
     use crate::config::CONFIG;
+    let branch = normalize_yuzu_branch_for_config(&branch);
     info!("切换 Yuzu 分支到: {}", branch);
 
     let mut cfg = CONFIG.write();

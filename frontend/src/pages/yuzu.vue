@@ -247,8 +247,15 @@ let yuzuConfig = computed(() => {
   return configStore.config.yuzu
 })
 let branch = computed(() => {
-  return configStore.config.yuzu.branch
+  return normalizeYuzuBranch(configStore.config.yuzu.branch)
 })
+
+function normalizeYuzuBranch(value: string) {
+  if (value === 'citron') {
+    return 'citron-stable'
+  }
+  return value
+}
 
 let branches = [
   {
@@ -258,9 +265,15 @@ let branches = [
     available: true
   },
   {
-    text: 'Citron',
-    value: 'citron',
-    name: 'Citron',
+    text: 'Citron Stable',
+    value: 'citron-stable',
+    name: 'Citron Stable',
+    available: true
+  },
+  {
+    text: 'Citron Nightly',
+    value: 'citron-nightly',
+    name: 'Citron Nightly',
     available: true
   },
   {
@@ -308,7 +321,7 @@ onBeforeMount(async () => {
   await configStore.reloadConfig()
   appStore.updateAvailableFirmwareInfos()
   selectedYuzuPath.value = configStore.config.yuzu.yuzu_path
-  selectedBranch.value = configStore.config.yuzu.branch
+  selectedBranch.value = normalizeYuzuBranch(configStore.config.yuzu.branch)
   handleSelectedBranchUpdate()
   await updateLastOpenEmuPage('yuzu')
 })
@@ -401,6 +414,7 @@ async function installYuzuHandler() {
   try {
     await installYuzuAPI(targetYuzuVersion.value, branch.value)
     await configStore.reloadConfig()
+    selectedBranch.value = normalizeYuzuBranch(configStore.config.yuzu.branch)
     // 成功消息已经通过后端的 send_notify 发送，不需要在这里重复显示
   } catch (error) {
     // 错误消息已经通过 notify_message 事件发送，不需要在这里重复显示
@@ -422,7 +436,7 @@ async function detectFirmwareVersion() {
 
 async function loadChangeLog() {
   try {
-    const response = await getYuzuChangeLogs()
+    const response = await getYuzuChangeLogs(selectedBranch.value)
     if (response.code === 0) {
       changeLogHtml.value = markdown.parse(response.data || '')
     } else {
@@ -439,11 +453,11 @@ async function detectYuzuVersionHandler() {
   try {
     const response = await detectYuzuVersionAPI()
     await configStore.reloadConfig()
+    selectedBranch.value = normalizeYuzuBranch(configStore.config.yuzu.branch)
 
     if (response.code === 0) {
       console.log(previousBranch, branch.value)
       if (previousBranch !== branch.value) {
-        selectedBranch.value = branch.value
         await handleSelectedBranchUpdate()
       }
       consoleDialogStore.appendConsoleMessage('Yuzu 版本检测完成')
@@ -484,10 +498,13 @@ async function modifyYuzuPath() {
 
       let oldBranch = configStore.config.yuzu.branch
       await configStore.reloadConfig()
+      const newBranch = normalizeYuzuBranch(configStore.config.yuzu.branch)
 
-      if (oldBranch !== configStore.config.yuzu.branch) {
-        selectedBranch.value = configStore.config.yuzu.branch
+      if (normalizeYuzuBranch(oldBranch) !== newBranch) {
+        selectedBranch.value = newBranch
         await handleSelectedBranchUpdate()
+      } else {
+        selectedBranch.value = newBranch
       }
 
       await loadHistoryPathList()
@@ -518,10 +535,13 @@ async function updateYuzuPathHandler() {
     await configStore.reloadConfig()
     await loadHistoryPathList()
     selectedYuzuPath.value = configStore.yuzuConfig.yuzu_path
+    const newBranch = normalizeYuzuBranch(configStore.yuzuConfig.branch)
 
-    if (oldBranch !== configStore.yuzuConfig.branch) {
-      selectedBranch.value = configStore.yuzuConfig.branch
+    if (normalizeYuzuBranch(oldBranch) !== newBranch) {
+      selectedBranch.value = newBranch
       await handleSelectedBranchUpdate()
+    } else {
+      selectedBranch.value = newBranch
     }
   } catch (error) {
     consoleDialogStore.appendConsoleMessage(`更新路径失败: ${error}`)

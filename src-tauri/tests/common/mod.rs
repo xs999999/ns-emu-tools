@@ -29,6 +29,7 @@ impl TestConfigHelper {
     }
 
     /// 设置为全局配置
+    #[allow(dead_code)]
     pub fn apply_to_global_config(&self) {
         use ns_emu_tools_lib::config::CONFIG;
 

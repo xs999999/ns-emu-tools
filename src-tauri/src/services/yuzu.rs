@@ -4,6 +4,12 @@
 
 use crate::config::{get_config, CONFIG};
 use crate::error::{AppError, AppResult};
+use crate::models::yuzu_branch::{
+    is_citron_branch, is_downloadable_yuzu_branch, normalize_downloadable_yuzu_branch,
+    normalize_yuzu_branch, yuzu_user_dir_branch, CITRON_NIGHTLY_BRANCH, CITRON_STABLE_BRANCH,
+    DOWNLOAD_AVAILABLE_BRANCHES, EDEN_BRANCH, LEGACY_CITRON_BRANCH, LEGACY_YUZU_BRANCH,
+    YUZU_EA_BRANCH, YUZU_MAINLINE_BRANCH,
+};
 use crate::models::{ProgressEvent, ProgressStatus, ProgressStep}; // Import models
 use crate::repositories::yuzu::{get_latest_change_log, get_yuzu_release_info_by_version};
 use crate::services::downloader::{get_download_manager, DownloadOptions, DownloadProgress};
@@ -23,7 +29,6 @@ use crate::utils::{finalize_macos_app_install, get_macos_bundle_executable_path}
 use once_cell::sync::Lazy;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-#[cfg(not(target_os = "macos"))]
 use std::time::Duration;
 use tracing::{debug, info, warn};
 #[cfg(not(target_os = "macos"))]
@@ -36,10 +41,6 @@ const DETECT_EXE_LIST: &[&str] = &["Eden.app", "Citron.app", "yuzu.app"];
 #[cfg(not(target_os = "macos"))]
 const DETECT_EXE_LIST: &[&str] = &["yuzu.exe", "eden.exe", "citron.exe", "suzu.exe", "cemu.exe"];
 
-/// 支持下载的分支
-const DOWNLOAD_AVAILABLE_BRANCH: &[&str] = &[EDEN_BRANCH, CITRON_BRANCH];
-const EDEN_BRANCH: &str = "eden";
-const CITRON_BRANCH: &str = "citron";
 const EDEN_NAME: &str = "Eden";
 
 static INSTALL_FLOW_LOCK: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
@@ -57,15 +58,36 @@ fn emulator_download_title(branch: &str) -> String {
 
 /// 获取模拟器名称
 pub fn get_emu_name(branch: &str) -> &'static str {
-    match branch {
-        "eden" => EDEN_NAME,
-        "citron" => "Citron",
+    match normalize_yuzu_branch(branch) {
+        Some(EDEN_BRANCH) => EDEN_NAME,
+        Some(CITRON_STABLE_BRANCH) => "Citron Stable",
+        Some(CITRON_NIGHTLY_BRANCH) => "Citron Nightly",
+        Some(YUZU_EA_BRANCH) => "Yuzu EA",
+        Some(YUZU_MAINLINE_BRANCH | LEGACY_YUZU_BRANCH) => "Yuzu",
         _ => "Yuzu",
     }
 }
 
+pub fn normalize_yuzu_branch_for_config(branch: &str) -> String {
+    if is_downloadable_yuzu_branch(branch) {
+        normalize_downloadable_yuzu_branch(branch)
+            .unwrap()
+            .to_string()
+    } else {
+        normalize_yuzu_branch(branch).unwrap_or(branch).to_string()
+    }
+}
+
 fn unsupported_install_branch_error(branch: &str) -> AppError {
-    AppError::InvalidArgument(format!("不支持的分支: {}，当前支持 eden、citron", branch))
+    AppError::InvalidArgument(format!(
+        "不支持的分支: {}，当前支持 eden、citron-stable、citron-nightly",
+        branch
+    ))
+}
+
+fn require_downloadable_yuzu_branch(branch: &str) -> AppResult<&'static str> {
+    normalize_downloadable_yuzu_branch(branch)
+        .ok_or_else(|| unsupported_install_branch_error(branch))
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -76,40 +98,34 @@ fn unsupported_citron_linux_error() -> AppError {
 }
 
 fn validate_yuzu_install_platform(branch: &str) -> AppResult<()> {
-    match branch {
-        EDEN_BRANCH => Ok(()),
-        CITRON_BRANCH => {
-            #[cfg(target_os = "linux")]
-            {
-                return Err(unsupported_citron_linux_error());
-            }
+    let branch = require_downloadable_yuzu_branch(branch)?;
+    if branch == EDEN_BRANCH {
+        return Ok(());
+    }
 
-            #[cfg(not(target_os = "linux"))]
-            {
-                Ok(())
-            }
+    if is_citron_branch(branch) {
+        #[cfg(target_os = "linux")]
+        {
+            return Err(unsupported_citron_linux_error());
         }
-        _ => Err(unsupported_install_branch_error(branch)),
-    }
-}
 
-fn normalize_yuzu_branch(branch: &str) -> Option<&'static str> {
-    match branch {
-        "eden" => Some("eden"),
-        "citron" => Some("citron"),
-        "mainline" | "ea" | "yuzu" => Some("yuzu"),
-        _ => None,
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Ok(());
+        }
     }
+
+    Err(unsupported_install_branch_error(branch))
 }
 
 fn preferred_yuzu_user_dir_names(branch: &str) -> Vec<&'static str> {
     let mut names = Vec::new();
 
-    if let Some(primary) = normalize_yuzu_branch(branch) {
+    if let Some(primary) = yuzu_user_dir_branch(branch) {
         names.push(primary);
     }
 
-    for fallback in ["eden", "yuzu", "citron"] {
+    for fallback in [EDEN_BRANCH, LEGACY_YUZU_BRANCH, LEGACY_CITRON_BRANCH] {
         if !names.contains(&fallback) {
             names.push(fallback);
         }
@@ -120,11 +136,7 @@ fn preferred_yuzu_user_dir_names(branch: &str) -> Vec<&'static str> {
 
 #[cfg(not(target_os = "windows"))]
 fn default_yuzu_user_dir_name(branch: &str) -> &'static str {
-    normalize_yuzu_branch(branch).unwrap_or("eden")
-}
-
-fn is_macos_target() -> bool {
-    cfg!(target_os = "macos")
+    yuzu_user_dir_branch(branch).unwrap_or(EDEN_BRANCH)
 }
 
 fn find_existing_yuzu_user_dir(base_dir: &Path, branch: &str) -> Option<PathBuf> {
@@ -137,9 +149,11 @@ fn find_existing_yuzu_user_dir(base_dir: &Path, branch: &str) -> Option<PathBuf>
 #[cfg(target_os = "macos")]
 fn get_macos_bundle_spec(branch: &str) -> Option<(&'static str, &'static str)> {
     match normalize_yuzu_branch(branch) {
-        Some("eden") => Some(("Eden.app", "Eden")),
-        Some("citron") => Some(("Citron.app", "Citron")),
-        Some("yuzu") => Some(("yuzu.app", "yuzu")),
+        Some(EDEN_BRANCH) => Some(("Eden.app", "Eden")),
+        Some(CITRON_STABLE_BRANCH | CITRON_NIGHTLY_BRANCH) => Some(("Citron.app", "Citron")),
+        Some(YUZU_MAINLINE_BRANCH | YUZU_EA_BRANCH | LEGACY_YUZU_BRANCH) => {
+            Some(("yuzu.app", "yuzu"))
+        }
         _ => None,
     }
 }
@@ -148,11 +162,11 @@ fn get_macos_bundle_spec(branch: &str) -> Option<(&'static str, &'static str)> {
 fn macos_bundle_search_order(preferred_branch: &str) -> Vec<&'static str> {
     let mut order = Vec::new();
 
-    if let Some(branch) = normalize_yuzu_branch(preferred_branch) {
+    if let Some(branch) = yuzu_user_dir_branch(preferred_branch) {
         order.push(branch);
     }
 
-    for fallback in ["eden", "yuzu", "citron"] {
+    for fallback in [EDEN_BRANCH, LEGACY_YUZU_BRANCH, LEGACY_CITRON_BRANCH] {
         if !order.contains(&fallback) {
             order.push(fallback);
         }
@@ -193,18 +207,21 @@ fn get_default_macos_executable_name(preferred_branch: &str) -> &'static str {
 #[cfg(target_os = "macos")]
 fn infer_branch_from_macos_app_name(app_name: &str) -> Option<String> {
     match app_name {
-        "Eden.app" => Some("eden".to_string()),
-        "Citron.app" => Some("citron".to_string()),
-        "yuzu.app" => Some("mainline".to_string()),
+        "Eden.app" => Some(EDEN_BRANCH.to_string()),
+        "Citron.app" => Some(CITRON_STABLE_BRANCH.to_string()),
+        "yuzu.app" => Some(YUZU_MAINLINE_BRANCH.to_string()),
         _ => None,
     }
 }
 
 /// 选择 macOS 下载资源
+#[cfg(any(target_os = "macos", test))]
 fn select_macos_asset(
     release_info: &crate::models::release::ReleaseInfo,
     branch: &str,
 ) -> Option<String> {
+    let branch = normalize_downloadable_yuzu_branch(branch)?;
+
     for asset in &release_info.assets {
         let name = &asset.name;
 
@@ -222,7 +239,7 @@ fn select_macos_asset(
                 debug!("选择 Eden macOS 资源: {}", name);
                 return Some(asset.download_url.clone());
             }
-            CITRON_BRANCH
+            CITRON_STABLE_BRANCH | CITRON_NIGHTLY_BRANCH
                 if name_lower.starts_with("citron-macos-") && name_lower.ends_with(".dmg") =>
             {
                 debug!("选择 Citron macOS DMG 资源: {}", name);
@@ -234,10 +251,13 @@ fn select_macos_asset(
     None
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn select_windows_asset(
     release_info: &crate::models::release::ReleaseInfo,
     branch: &str,
 ) -> Option<String> {
+    let branch = normalize_downloadable_yuzu_branch(branch)?;
+
     match branch {
         EDEN_BRANCH => {
             for asset in &release_info.assets {
@@ -257,7 +277,7 @@ fn select_windows_asset(
             }
             None
         }
-        CITRON_BRANCH => release_info
+        CITRON_STABLE_BRANCH | CITRON_NIGHTLY_BRANCH => release_info
             .assets
             .iter()
             .find(|asset| {
@@ -282,6 +302,27 @@ fn select_windows_asset(
     }
 }
 
+pub fn select_current_platform_yuzu_asset(
+    release_info: &crate::models::release::ReleaseInfo,
+    branch: &str,
+) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        select_macos_asset(release_info, branch)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        select_windows_asset(release_info, branch)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (release_info, branch);
+        None
+    }
+}
+
 /// 下载 Eden
 ///
 /// # 参数
@@ -299,11 +340,13 @@ pub async fn download_yuzu<F>(
 where
     F: Fn(DownloadProgress) + Send + 'static,
 {
+    let branch = require_downloadable_yuzu_branch(branch)?;
+
     // 检查分支是否支持
-    if !DOWNLOAD_AVAILABLE_BRANCH.contains(&branch) {
+    if !DOWNLOAD_AVAILABLE_BRANCHES.contains(&branch) {
         warn!(
             "不支持的分支: {}, 支持的分支: {:?}",
-            branch, DOWNLOAD_AVAILABLE_BRANCH
+            branch, DOWNLOAD_AVAILABLE_BRANCHES
         );
         return Err(unsupported_install_branch_error(branch));
     }
@@ -336,11 +379,7 @@ where
     );
 
     // 查找下载 URL - 根据平台选择
-    let download_url: Option<String> = if is_macos_target() {
-        select_macos_asset(&release_info, branch)
-    } else {
-        select_windows_asset(&release_info, branch)
-    };
+    let download_url: Option<String> = select_current_platform_yuzu_asset(&release_info, branch);
 
     let url = download_url.ok_or_else(|| {
         warn!("无法找到合适的下载资源");
@@ -352,9 +391,20 @@ where
     // 使用统一下载接口
     debug!("创建下载任务");
     let download_manager = get_download_manager().await?;
-    let options = DownloadOptions {
-        use_github_mirror: url.contains("github.com"),
-        ..Default::default()
+    let options = if url.contains("github.com") {
+        DownloadOptions {
+            use_github_mirror: true,
+            split: 1,
+            max_connection_per_server: 1,
+            min_split_size: "64M".to_string(),
+            read_timeout: Duration::from_secs(180),
+            ..Default::default()
+        }
+    } else {
+        DownloadOptions {
+            use_github_mirror: false,
+            ..Default::default()
+        }
     };
 
     // 下载并等待完成
@@ -448,9 +498,10 @@ where
 }
 
 fn yuzu_download_source_origin(branch: &str) -> &'static str {
-    match branch {
-        EDEN_BRANCH => "https://git.eden-emu.dev",
-        CITRON_BRANCH => "https://github.com/citron-neo/emulator",
+    match normalize_yuzu_branch(branch) {
+        Some(EDEN_BRANCH) => "https://git.eden-emu.dev",
+        Some(CITRON_STABLE_BRANCH) => "https://github.com/citron-neo/emulator",
+        Some(CITRON_NIGHTLY_BRANCH) => "https://github.com/citron-neo/CI",
         _ => "https://github.com",
     }
 }
@@ -727,9 +778,10 @@ where
 
     let package_path_for_extract = package_path.to_path_buf();
     let staging_dir_for_extract = staging_dir.clone();
-    let extract_task_name = match task_label {
-        "citron" => "extract_citron_package",
-        _ => "extract_eden_package",
+    let extract_task_name = if is_citron_branch(task_label) {
+        "extract_citron_package"
+    } else {
+        "extract_eden_package"
     };
     if let Err(error) = spawn_blocking_io(extract_task_name, move || {
         unzip_yuzu(&package_path_for_extract, Some(&staging_dir_for_extract)).map(|_| ())
@@ -754,9 +806,10 @@ where
 
     let staging_dir_for_install = staging_dir.clone();
     let yuzu_path_for_install = yuzu_path.to_path_buf();
-    let install_task_name = match task_label {
-        "citron" => "install_citron_files",
-        _ => "install_eden_files",
+    let install_task_name = if is_citron_branch(task_label) {
+        "install_citron_files"
+    } else {
+        "install_eden_files"
     };
     if let Err(error) = spawn_blocking_io(install_task_name, move || {
         copy_back_yuzu_files(&staging_dir_for_install, &yuzu_path_for_install)
@@ -797,11 +850,12 @@ async fn install_citron_windows_step<F>(
     package_path: &Path,
     yuzu_path: &Path,
     on_event: F,
+    branch: &'static str,
 ) -> AppResult<()>
 where
     F: Fn(ProgressEvent) + Send + Sync + 'static + Clone,
 {
-    install_windows_zip_step(package_path, yuzu_path, on_event, CITRON_BRANCH).await
+    install_windows_zip_step(package_path, yuzu_path, on_event, branch).await
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -872,13 +926,18 @@ where
     Ok(())
 }
 
-pub async fn install_citron<F>(target_version: &str, on_event: F) -> AppResult<()>
+pub async fn install_citron<F>(target_version: &str, branch: &str, on_event: F) -> AppResult<()>
 where
     F: Fn(ProgressEvent) + Send + Sync + 'static + Clone,
 {
-    info!("开始安装 Citron 版本: {}", target_version);
+    let branch = require_downloadable_yuzu_branch(branch)?;
+    if !is_citron_branch(branch) {
+        return Err(unsupported_install_branch_error(branch));
+    }
 
-    validate_yuzu_install_platform(CITRON_BRANCH)?;
+    info!("开始安装 {} 版本: {}", get_emu_name(branch), target_version);
+
+    validate_yuzu_install_platform(branch)?;
 
     let (yuzu_path, auto_delete) = {
         let config = get_config();
@@ -888,15 +947,14 @@ where
         )
     };
 
-    validate_yuzu_release_step(target_version, CITRON_BRANCH, on_event.clone()).await?;
-    let package_path =
-        download_yuzu_package_step(target_version, CITRON_BRANCH, on_event.clone()).await?;
+    validate_yuzu_release_step(target_version, branch, on_event.clone()).await?;
+    let package_path = download_yuzu_package_step(target_version, branch, on_event.clone()).await?;
 
     #[cfg(target_os = "macos")]
     install_citron_macos_step(&package_path, &yuzu_path, on_event.clone()).await?;
 
     #[cfg(not(target_os = "macos"))]
-    install_citron_windows_step(&package_path, &yuzu_path, on_event.clone()).await?;
+    install_citron_windows_step(&package_path, &yuzu_path, on_event.clone(), branch).await?;
 
     #[cfg(target_os = "macos")]
     emit_step(&on_event, success_step(STEP_CHECK_ENV, TITLE_CHECK_ENV));
@@ -991,9 +1049,9 @@ pub fn remove_target_app(branch: &str) -> AppResult<()> {
 
     #[cfg(not(target_os = "macos"))]
     {
-        let exe_name = match branch {
-            "eden" => "eden.exe",
-            "citron" => "citron.exe",
+        let exe_name = match normalize_yuzu_branch(branch) {
+            Some(EDEN_BRANCH) => "eden.exe",
+            Some(CITRON_STABLE_BRANCH | CITRON_NIGHTLY_BRANCH) => "citron.exe",
             _ => return Ok(()),
         };
         let exe_path = yuzu_path.join(exe_name);
@@ -1049,6 +1107,8 @@ pub async fn install_yuzu<F>(target_version: &str, branch: &str, on_event: F) ->
 where
     F: Fn(ProgressEvent) + Send + Sync + 'static + Clone,
 {
+    let branch = require_downloadable_yuzu_branch(branch)?;
+
     info!(
         "安装 {} 版本: {}, 分支: {}",
         get_emu_name(branch),
@@ -1069,7 +1129,9 @@ where
     if let Some(ref cv) = current_version {
         let current_branch = {
             let config = get_config();
-            config.yuzu.branch.clone()
+            normalize_yuzu_branch(&config.yuzu.branch)
+                .unwrap_or(config.yuzu.branch.as_str())
+                .to_string()
         };
         if cv == target_version && current_branch == branch {
             warn!("当前已是目标版本，跳过安装");
@@ -1171,8 +1233,10 @@ where
 
     // 根据分支安装
     match branch {
-        "eden" => install_eden(target_version, on_event).await?,
-        "citron" => install_citron(target_version, on_event).await?,
+        EDEN_BRANCH => install_eden(target_version, on_event).await?,
+        CITRON_STABLE_BRANCH | CITRON_NIGHTLY_BRANCH => {
+            install_citron(target_version, branch, on_event).await?
+        }
         _ => return Err(unsupported_install_branch_error(branch)),
     }
 
@@ -1347,7 +1411,7 @@ fn infer_branch_from_marker(text: &str) -> Option<&'static str> {
         || marker.starts_with("Eden ")
         || marker.starts_with("Eden | ")
     {
-        return Some("eden");
+        return Some(EDEN_BRANCH);
     }
 
     if marker.eq_ignore_ascii_case("citron")
@@ -1356,15 +1420,15 @@ fn infer_branch_from_marker(text: &str) -> Option<&'static str> {
         || marker.starts_with("Citron | ")
         || marker.starts_with("citron | ")
     {
-        return Some("citron");
+        return Some(CITRON_STABLE_BRANCH);
     }
 
     if marker.starts_with("yuzu Early Access ") {
-        return Some("ea");
+        return Some(YUZU_EA_BRANCH);
     }
 
     if marker.eq_ignore_ascii_case("yuzu") || marker.starts_with("yuzu ") {
-        return Some("mainline");
+        return Some(YUZU_MAINLINE_BRANCH);
     }
 
     None
@@ -1374,13 +1438,13 @@ fn detect_yuzu_version_from_ascii_strings(strings: &[String]) -> Option<(String,
     for text in strings {
         for prefix in ["Eden | ", "Eden "] {
             if let Some(version) = extract_version_after_prefix(text, prefix) {
-                return Some((version, Some("eden".to_string())));
+                return Some((version, Some(EDEN_BRANCH.to_string())));
             }
         }
 
         for prefix in ["Citron | ", "citron | ", "Citron ", "citron "] {
             if let Some(version) = extract_version_after_prefix(text, prefix) {
-                return Some((version, Some("citron".to_string())));
+                return Some((version, Some(CITRON_STABLE_BRANCH.to_string())));
             }
         }
 
@@ -1389,7 +1453,7 @@ fn detect_yuzu_version_from_ascii_strings(strings: &[String]) -> Option<(String,
                 continue;
             };
             if version.chars().all(|c| c.is_ascii_digit()) {
-                return Some((version.to_string(), Some("ea".to_string())));
+                return Some((version.to_string(), Some(YUZU_EA_BRANCH.to_string())));
             }
         }
 
@@ -1398,7 +1462,7 @@ fn detect_yuzu_version_from_ascii_strings(strings: &[String]) -> Option<(String,
                 continue;
             };
             if version.chars().all(|c| c.is_ascii_digit()) {
-                return Some((version.to_string(), Some("mainline".to_string())));
+                return Some((version.to_string(), Some(YUZU_MAINLINE_BRANCH.to_string())));
             }
         }
     }
@@ -1546,7 +1610,7 @@ fn save_detected_yuzu_version(version: &str, branch: Option<&str>) -> AppResult<
     let mut cfg = CONFIG.write();
     cfg.yuzu.yuzu_version = Some(version.to_string());
     if let Some(branch) = branch {
-        cfg.yuzu.branch = branch.to_string();
+        cfg.yuzu.branch = normalize_yuzu_branch_for_config(branch);
     }
     cfg.save()?;
 
@@ -1647,10 +1711,10 @@ pub async fn detect_yuzu_version() -> AppResult<Option<String>> {
                         let mut guard = data.lock().unwrap();
                         if window_title.starts_with("yuzu Early Access ") {
                             guard.0 = Some(window_title[18..].to_string());
-                            guard.1 = Some("ea".to_string());
+                            guard.1 = Some(YUZU_EA_BRANCH.to_string());
                         } else {
                             guard.0 = Some(window_title[5..].to_string());
-                            guard.1 = Some("mainline".to_string());
+                            guard.1 = Some(YUZU_MAINLINE_BRANCH.to_string());
                         }
                         return windows::Win32::Foundation::BOOL(0); // Stop enumeration
                     } else if window_title.starts_with("Eden | ") {
@@ -1664,7 +1728,7 @@ pub async fn detect_yuzu_version() -> AppResult<Option<String>> {
                             version_part.to_string()
                         };
                         guard.0 = Some(version);
-                        guard.1 = Some("eden".to_string());
+                        guard.1 = Some(EDEN_BRANCH.to_string());
                         return windows::Win32::Foundation::BOOL(0);
                     } else if window_title.starts_with("citron | ") {
                         let mut guard = data.lock().unwrap();
@@ -1676,7 +1740,7 @@ pub async fn detect_yuzu_version() -> AppResult<Option<String>> {
                             version_part.to_string()
                         };
                         guard.0 = Some(version);
-                        guard.1 = Some("citron".to_string());
+                        guard.1 = Some(CITRON_STABLE_BRANCH.to_string());
                         return windows::Win32::Foundation::BOOL(0);
                     }
                 }
@@ -2094,16 +2158,17 @@ pub fn update_yuzu_path(new_yuzu_path: &str) -> AppResult<()> {
     Ok(())
 }
 
+pub async fn get_yuzu_change_logs_for_branch(branch: &str) -> AppResult<String> {
+    let branch = require_downloadable_yuzu_branch(branch)?;
+    let changelog = get_latest_change_log(branch).await?;
+    Ok(changelog)
+}
+
 /// 获取变更日志
 pub async fn get_yuzu_change_logs() -> AppResult<String> {
     // 直接获取配置的克隆
-    let branch = get_config().yuzu.branch.clone();
-    if !DOWNLOAD_AVAILABLE_BRANCH.contains(&branch.as_str()) {
-        return Err(unsupported_install_branch_error(&branch));
-    }
-
-    let changelog = get_latest_change_log(&branch).await?;
-    Ok(changelog)
+    let config_branch = get_config().yuzu.branch.clone();
+    get_yuzu_change_logs_for_branch(&config_branch).await
 }
 
 /// 安装固件到 Yuzu
@@ -2235,8 +2300,26 @@ mod tests {
     #[test]
     fn test_get_emu_name() {
         assert_eq!(get_emu_name("eden"), "Eden");
-        assert_eq!(get_emu_name("citron"), "Citron");
+        assert_eq!(get_emu_name("citron"), "Citron Stable");
+        assert_eq!(get_emu_name(CITRON_STABLE_BRANCH), "Citron Stable");
+        assert_eq!(get_emu_name(CITRON_NIGHTLY_BRANCH), "Citron Nightly");
         assert_eq!(get_emu_name("unknown"), "Yuzu");
+    }
+
+    #[test]
+    fn test_citron_legacy_branch_normalizes_to_stable() {
+        assert_eq!(
+            require_downloadable_yuzu_branch("citron").unwrap(),
+            CITRON_STABLE_BRANCH
+        );
+        assert_eq!(
+            require_downloadable_yuzu_branch(CITRON_NIGHTLY_BRANCH).unwrap(),
+            CITRON_NIGHTLY_BRANCH
+        );
+        assert_eq!(
+            normalize_yuzu_branch_for_config("citron"),
+            CITRON_STABLE_BRANCH
+        );
     }
 
     #[test]
@@ -2260,7 +2343,7 @@ mod tests {
         let detected = detect_yuzu_version_from_ascii_strings(&strings);
         assert_eq!(
             detected,
-            Some(("v0.2.0-rc1".to_string(), Some("eden".to_string())))
+            Some(("v0.2.0-rc1".to_string(), Some(EDEN_BRANCH.to_string())))
         );
     }
 
@@ -2276,8 +2359,25 @@ mod tests {
         let detected = detect_yuzu_version_from_ascii_strings(&strings);
         assert_eq!(
             detected,
-            Some(("stable-01c042048".to_string(), Some("citron".to_string())))
+            Some((
+                "stable-01c042048".to_string(),
+                Some(CITRON_STABLE_BRANCH.to_string())
+            ))
         );
+    }
+
+    #[test]
+    fn test_citron_nightly_asset_name_does_not_change_detected_branch() {
+        let strings = vec![
+            "Random text".to_string(),
+            "Citron".to_string(),
+            "Citron-windows-nightly-0237a9b88-x64-msvc.zip".to_string(),
+            "2026-04-27".to_string(),
+            "stable-0237a9b88".to_string(),
+        ];
+
+        let detected = detect_yuzu_version_from_ascii_strings(&strings);
+        assert_eq!(detected.unwrap().1, Some(CITRON_STABLE_BRANCH.to_string()));
     }
 
     #[test]
@@ -2288,7 +2388,10 @@ mod tests {
         ];
 
         let detected = detect_yuzu_version_from_ascii_strings(&strings);
-        assert_eq!(detected, Some(("4176".to_string(), Some("ea".to_string()))));
+        assert_eq!(
+            detected,
+            Some(("4176".to_string(), Some(YUZU_EA_BRANCH.to_string())))
+        );
     }
 
     #[test]
@@ -2351,7 +2454,7 @@ mod tests {
             ],
         };
 
-        let url = select_windows_asset(&release, CITRON_BRANCH);
+        let url = select_windows_asset(&release, CITRON_STABLE_BRANCH);
         assert_eq!(url, Some("https://example.com/msvc.zip".to_string()));
     }
 
@@ -2372,7 +2475,7 @@ mod tests {
             }],
         };
 
-        let url = select_windows_asset(&release, CITRON_BRANCH);
+        let url = select_windows_asset(&release, CITRON_NIGHTLY_BRANCH);
         assert_eq!(url, Some("https://example.com/clangtron.zip".to_string()));
     }
 
@@ -2425,7 +2528,7 @@ mod tests {
             ],
         };
 
-        let url = select_macos_asset(&release, CITRON_BRANCH);
+        let url = select_macos_asset(&release, CITRON_STABLE_BRANCH);
         assert_eq!(url, Some("https://example.com/macos.dmg".to_string()));
     }
 
@@ -2443,6 +2546,10 @@ mod tests {
         );
         assert_eq!(
             find_existing_yuzu_user_dir(base, "citron"),
+            Some(base.join("citron"))
+        );
+        assert_eq!(
+            find_existing_yuzu_user_dir(base, CITRON_NIGHTLY_BRANCH),
             Some(base.join("citron"))
         );
         assert_eq!(
@@ -2492,7 +2599,7 @@ mod tests {
         let detected = detect_yuzu_version_from_bundle_metadata(&exe_path);
         assert_eq!(
             detected,
-            Some(("v0.2.0-rc1".to_string(), Some("eden".to_string())))
+            Some(("v0.2.0-rc1".to_string(), Some(EDEN_BRANCH.to_string())))
         );
     }
 
