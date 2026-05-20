@@ -23,13 +23,15 @@ use crate::services::installer::{
 use crate::services::msvc::check_and_install_msvc;
 use crate::services::network::get_download_source_name;
 use crate::utils::archive::uncompress;
-use crate::utils::spawn_blocking_io;
 #[cfg(target_os = "macos")]
 use crate::utils::{finalize_macos_app_install, get_macos_bundle_executable_path};
+use crate::utils::{spawn_blocking_io, write_string_atomic};
 use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
+use std::time::UNIX_EPOCH;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -41,8 +43,18 @@ const DETECT_EXE_LIST: &[&str] = &["Eden.app", "Citron.app", "yuzu.app"];
 const DETECT_EXE_LIST: &[&str] = &["yuzu.exe", "eden.exe", "citron.exe", "suzu.exe", "cemu.exe"];
 
 const EDEN_NAME: &str = "Eden";
+const YUZU_INSTALL_METADATA_FILE: &str = ".ns-emu-tools-install.json";
 
 static INSTALL_FLOW_LOCK: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct YuzuInstallMetadata {
+    version: String,
+    branch: String,
+    executable_name: String,
+    executable_size: u64,
+    executable_modified_secs: Option<u64>,
+}
 
 fn emit_step<F>(on_event: &F, step: ProgressStep)
 where
@@ -115,6 +127,125 @@ fn validate_yuzu_install_platform(branch: &str) -> AppResult<()> {
     }
 
     Err(unsupported_install_branch_error(branch))
+}
+
+fn yuzu_install_metadata_path(yuzu_path: &Path) -> PathBuf {
+    yuzu_path.join(YUZU_INSTALL_METADATA_FILE)
+}
+
+#[cfg(target_os = "macos")]
+fn yuzu_install_metadata_path_for_exe(exe_path: &Path) -> Option<PathBuf> {
+    let app_path = exe_path.ancestors().find(|ancestor| {
+        ancestor
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+    })?;
+
+    app_path.parent().map(yuzu_install_metadata_path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn yuzu_install_metadata_path_for_exe(exe_path: &Path) -> Option<PathBuf> {
+    exe_path.parent().map(yuzu_install_metadata_path)
+}
+
+fn executable_modified_secs(metadata: &std::fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+fn executable_install_fingerprint(exe_path: &Path) -> AppResult<(String, u64, Option<u64>)> {
+    let metadata = std::fs::metadata(exe_path)?;
+    let executable_name = exe_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            AppError::InvalidArgument(format!(
+                "无法获取模拟器可执行文件名称: {}",
+                exe_path.display()
+            ))
+        })?
+        .to_string();
+
+    Ok((
+        executable_name,
+        metadata.len(),
+        executable_modified_secs(&metadata),
+    ))
+}
+
+fn expected_yuzu_exe_path_for_branch(yuzu_path: &Path, branch: &str) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        get_default_macos_bundle_path(yuzu_path, branch)
+            .join("Contents/MacOS")
+            .join(get_default_macos_executable_name(branch))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        if get_config().setting.other.rename_yuzu_to_cemu && yuzu_path.join("cemu.exe").exists() {
+            return yuzu_path.join("cemu.exe");
+        }
+
+        let exe_name = match normalize_yuzu_branch(branch) {
+            Some(EDEN_BRANCH) => "eden.exe",
+            Some(CITRON_STABLE_BRANCH | CITRON_NIGHTLY_BRANCH) => "citron.exe",
+            Some(YUZU_MAINLINE_BRANCH | YUZU_EA_BRANCH | LEGACY_YUZU_BRANCH) => "yuzu.exe",
+            _ => "yuzu.exe",
+        };
+        yuzu_path.join(exe_name)
+    }
+}
+
+fn write_yuzu_install_metadata(yuzu_path: &Path, version: &str, branch: &str) -> AppResult<()> {
+    let branch = normalize_yuzu_branch_for_config(branch);
+    let exe_path = expected_yuzu_exe_path_for_branch(yuzu_path, &branch);
+    let (executable_name, executable_size, executable_modified_secs) =
+        executable_install_fingerprint(&exe_path)?;
+
+    let metadata = YuzuInstallMetadata {
+        version: version.to_string(),
+        branch,
+        executable_name,
+        executable_size,
+        executable_modified_secs,
+    };
+    let content = serde_json::to_string_pretty(&metadata)?;
+    write_string_atomic(&yuzu_install_metadata_path(yuzu_path), &content)
+}
+
+fn detect_yuzu_version_from_install_metadata(exe_path: &Path) -> Option<(String, Option<String>)> {
+    let metadata_path = yuzu_install_metadata_path_for_exe(exe_path)?;
+    let content = std::fs::read_to_string(&metadata_path).ok()?;
+    let metadata: YuzuInstallMetadata = serde_json::from_str(&content).ok()?;
+    let branch = normalize_yuzu_branch(&metadata.branch)?;
+
+    let (executable_name, executable_size, executable_modified_secs) =
+        executable_install_fingerprint(exe_path).ok()?;
+    if !metadata
+        .executable_name
+        .eq_ignore_ascii_case(&executable_name)
+        || metadata.executable_size != executable_size
+        || metadata.executable_modified_secs != executable_modified_secs
+    {
+        debug!(
+            "安装元数据与当前可执行文件不匹配，跳过版本回退检测: {}",
+            metadata_path.display()
+        );
+        return None;
+    }
+
+    if metadata.version.trim().is_empty() {
+        return None;
+    }
+
+    Some((metadata.version, Some(branch.to_string())))
 }
 
 fn preferred_yuzu_user_dir_names(branch: &str) -> Vec<&'static str> {
@@ -1291,6 +1422,10 @@ where
         cfg.save()?;
     }
 
+    if let Err(error) = write_yuzu_install_metadata(&yuzu_path, target_version, branch) {
+        warn!("保存模拟器安装元数据失败: {}", error);
+    }
+
     info!("{} [{}] 安装成功", get_emu_name(branch), target_version);
     Ok(())
 }
@@ -1659,6 +1794,12 @@ pub async fn detect_yuzu_version() -> AppResult<Option<String>> {
             save_detected_yuzu_version(&version, branch.as_deref())?;
             return Ok(Some(version));
         }
+    }
+
+    if let Some((version, branch)) = detect_yuzu_version_from_install_metadata(&exe_path) {
+        info!("通过安装元数据检测到版本: {}, 分支: {:?}", version, branch);
+        save_detected_yuzu_version(&version, branch.as_deref())?;
+        return Ok(Some(version));
     }
 
     #[cfg(not(windows))]
@@ -2407,6 +2548,37 @@ mod tests {
             detected,
             Some(("4176".to_string(), Some(YUZU_EA_BRANCH.to_string())))
         );
+    }
+
+    #[test]
+    fn test_detect_yuzu_version_from_install_metadata() {
+        let dir = tempdir().unwrap();
+        let exe_path = dir.path().join("citron.exe");
+        std::fs::write(&exe_path, b"citron nightly executable").unwrap();
+
+        write_yuzu_install_metadata(dir.path(), "0237a9b", CITRON_NIGHTLY_BRANCH).unwrap();
+
+        let detected = detect_yuzu_version_from_install_metadata(&exe_path);
+        assert_eq!(
+            detected,
+            Some((
+                "0237a9b".to_string(),
+                Some(CITRON_NIGHTLY_BRANCH.to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn test_install_metadata_is_ignored_when_executable_changes() {
+        let dir = tempdir().unwrap();
+        let exe_path = dir.path().join("citron.exe");
+        std::fs::write(&exe_path, b"old citron executable").unwrap();
+
+        write_yuzu_install_metadata(dir.path(), "0237a9b", CITRON_NIGHTLY_BRANCH).unwrap();
+        std::fs::write(&exe_path, b"new citron executable with a different size").unwrap();
+
+        let detected = detect_yuzu_version_from_install_metadata(&exe_path);
+        assert_eq!(detected, None);
     }
 
     #[test]

@@ -9,7 +9,9 @@ use ns_emu_tools_lib::models::yuzu_branch::{CITRON_NIGHTLY_BRANCH, CITRON_STABLE
 use ns_emu_tools_lib::repositories::yuzu::{
     get_yuzu_release_info_by_version, yuzu_release_api_for_branch,
 };
-use ns_emu_tools_lib::services::yuzu::{install_yuzu, select_current_platform_yuzu_asset};
+use ns_emu_tools_lib::services::yuzu::{
+    detect_yuzu_version, install_yuzu, select_current_platform_yuzu_asset,
+};
 use once_cell::sync::Lazy;
 use std::path::Path;
 use tokio::sync::Mutex;
@@ -217,6 +219,32 @@ async fn assert_citron_install_backend_e2e(branch: &str, expected_api_fragment: 
             "{branch} should save the installed branch"
         );
         assert_citron_installed_at(&config.yuzu.yuzu_path);
+
+        {
+            let mut config = CONFIG.write();
+            config.yuzu.yuzu_version = None;
+            config.yuzu.branch = branch.to_string();
+        }
+
+        let detected_version = detect_yuzu_version()
+            .await
+            .unwrap_or_else(|error| panic!("detecting installed {branch} version failed: {error}"))
+            .unwrap_or_else(|| panic!("installed {branch} version should be detectable"));
+        info!(
+            "Detected installed Citron {} version {}",
+            branch, detected_version
+        );
+
+        let config = get_config();
+        assert_eq!(
+            config.yuzu.yuzu_version.as_deref(),
+            Some(detected_version.as_str()),
+            "{branch} detect version should save the detected version"
+        );
+        assert_eq!(
+            config.yuzu.branch, branch,
+            "{branch} detect version should preserve the installed branch"
+        );
     }
 }
 
