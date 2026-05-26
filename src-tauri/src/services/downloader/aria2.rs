@@ -31,7 +31,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -46,6 +46,9 @@ const ARIA2_SECRET: &str = "ns-emu-tools-aria2";
 
 /// Aria2 安装下载默认 GitHub 镜像
 const DEFAULT_ARIA2_DOWNLOAD_MIRROR: &str = "https://nsarchive.e6ex.com/gh";
+const ARIA2_FILE_EXISTS_ERROR_CODE: &str = "13";
+const SKIPPED_EXISTING_FILE_GID: &str = "skipped-existing-file";
+static SKIPPED_DOWNLOAD_ID: AtomicU64 = AtomicU64::new(1);
 
 /// 全局 Aria2Manager 实例
 static ARIA2_MANAGER: OnceCell<Arc<Aria2Manager>> = OnceCell::new();
@@ -227,6 +230,13 @@ pub struct Aria2DownloadOptions {
     pub total_timeout: Duration,
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedAria2Download {
+    url: String,
+    output_path: PathBuf,
+    filename: String,
+}
+
 impl Default for Aria2DownloadOptions {
     fn default() -> Self {
         Self {
@@ -280,6 +290,107 @@ fn format_bytes(bytes: u64) -> String {
     }
 
     format!("{:.1}{}", size, UNITS[unit_index])
+}
+
+fn resolve_download_url(url: &str, options: &Aria2DownloadOptions) -> String {
+    if options.use_github_mirror && url.contains("github.com") {
+        get_github_download_url(url)
+    } else {
+        get_final_url(url)
+    }
+}
+
+fn resolve_download_target(
+    url: &str,
+    options: &Aria2DownloadOptions,
+) -> AppResult<ResolvedAria2Download> {
+    let final_url = resolve_download_url(url, options);
+    let output_dir = match options.save_dir.clone() {
+        Some(save_dir) => save_dir,
+        None => get_default_download_dir()?,
+    };
+    let filename = options
+        .filename
+        .clone()
+        .unwrap_or_else(|| extract_filename_from_url(&final_url));
+    let output_path = output_dir.join(&filename);
+
+    Ok(ResolvedAria2Download {
+        url: final_url,
+        output_path,
+        filename,
+    })
+}
+
+fn existing_file_result(
+    target: &ResolvedAria2Download,
+    gid: String,
+) -> AppResult<Option<Aria2DownloadResult>> {
+    existing_file_result_from_path(&target.output_path, &target.filename, gid)
+}
+
+fn existing_file_result_from_path(
+    path: &Path,
+    fallback_filename: &str,
+    gid: String,
+) -> AppResult<Option<Aria2DownloadResult>> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(Aria2DownloadResult {
+            path: path.to_path_buf(),
+            filename: path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| fallback_filename.to_string()),
+            size: metadata.len(),
+            gid,
+        })),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(AppError::Io(error)),
+    }
+}
+
+fn is_aria2_file_exists_error(error_code: &str) -> bool {
+    error_code.trim() == ARIA2_FILE_EXISTS_ERROR_CODE
+}
+
+fn existing_file_result_for_aria2_error(
+    target: &ResolvedAria2Download,
+    gid: String,
+    error_code: &str,
+    aria2_file_path: Option<&str>,
+) -> AppResult<Option<Aria2DownloadResult>> {
+    if !is_aria2_file_exists_error(error_code) {
+        return Ok(None);
+    }
+
+    if let Some(path) = aria2_file_path.filter(|path| !path.trim().is_empty()) {
+        if let Some(result) =
+            existing_file_result_from_path(Path::new(path), &target.filename, gid.clone())?
+        {
+            return Ok(Some(result));
+        }
+    }
+
+    existing_file_result(target, gid)
+}
+
+fn completed_existing_file_progress(result: &Aria2DownloadResult) -> Aria2DownloadProgress {
+    Aria2DownloadProgress {
+        gid: result.gid.clone(),
+        downloaded: result.size,
+        total: result.size,
+        speed: 0,
+        percentage: 100.0,
+        eta: 0,
+        filename: result.filename.clone(),
+        status: Aria2DownloadStatus::Complete,
+    }
+}
+
+fn next_skipped_existing_file_gid() -> String {
+    let id = SKIPPED_DOWNLOAD_ID.fetch_add(1, Ordering::Relaxed);
+    format!("{SKIPPED_EXISTING_FILE_GID}-{id}")
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -562,16 +673,29 @@ impl Aria2Manager {
 
     /// 添加下载任务
     pub async fn download(&self, url: &str, options: Aria2DownloadOptions) -> AppResult<String> {
-        self.ensure_connected().await?;
-
         // 处理 URL（应用镜像）
-        let final_url = if options.use_github_mirror && url.contains("github.com") {
-            get_github_download_url(url)
-        } else {
-            get_final_url(url)
-        };
+        let target = resolve_download_target(url, &options)?;
+        let final_url = target.url.clone();
+        let filename = target.filename.clone();
 
         info!("添加下载任务: {}", final_url);
+
+        if !options.overwrite {
+            let gid = next_skipped_existing_file_gid();
+            if let Some(result) = existing_file_result(&target, gid)? {
+                info!(
+                    "目标文件已存在，跳过 aria2 下载任务: {}",
+                    target.output_path.display()
+                );
+                let progress = completed_existing_file_progress(&result);
+                self.active_downloads
+                    .write()
+                    .insert(result.gid.clone(), progress);
+                return Ok(result.gid);
+            }
+        }
+
+        self.ensure_connected().await?;
 
         // 构建 aria2 选项
         let mut task_options = TaskOptions::default();
@@ -681,10 +805,6 @@ impl Aria2Manager {
         info!("下载任务已添加，GID: {}", gid);
 
         // 记录活跃下载
-        let filename = options
-            .filename
-            .clone()
-            .unwrap_or_else(|| extract_filename_from_url(&final_url));
         debug!("下载任务详情: filename={}, url={}", filename, final_url);
 
         let progress = Aria2DownloadProgress::new(&gid, &filename);
@@ -704,7 +824,32 @@ impl Aria2Manager {
         F: Fn(Aria2DownloadProgress) + Send + 'static,
     {
         let total_timeout = options.total_timeout;
+        let target = resolve_download_target(url, &options)?;
+
+        if !options.overwrite {
+            if let Some(result) = existing_file_result(&target, next_skipped_existing_file_gid())? {
+                info!(
+                    "目标文件已存在，跳过 aria2 下载并复用本地文件: {}",
+                    result.path.display()
+                );
+                on_progress(completed_existing_file_progress(&result));
+                return Ok(result);
+            }
+        }
+
         let gid = self.download(url, options.clone()).await?;
+        if gid.starts_with(SKIPPED_EXISTING_FILE_GID) {
+            let result = existing_file_result(&target, gid.clone())?.ok_or_else(|| {
+                AppError::Aria2(format!(
+                    "跳过的下载文件不存在: {}",
+                    target.output_path.display()
+                ))
+            })?;
+            on_progress(completed_existing_file_progress(&result));
+            self.active_downloads.write().remove(&gid);
+            return Ok(result);
+        }
+
         let gid_for_wait = gid.clone();
         debug!("开始等待下载完成，GID: {}", gid);
 
@@ -726,10 +871,9 @@ impl Aria2Manager {
                     last_status = Some(progress.status);
                 }
 
-                on_progress(progress.clone());
-
                 match progress.status {
                     Aria2DownloadStatus::Complete => {
+                        on_progress(progress.clone());
                         info!("下载完成 [GID: {}]", gid);
                         let status = self.get_download_status(&gid).await?;
                         let path = status
@@ -763,7 +907,25 @@ impl Aria2Manager {
                         let error_code =
                             status.error_code.map(|c| c.to_string()).unwrap_or_default();
                         let error_msg = status.error_message.clone().unwrap_or_default();
+                        let aria2_file_path = status.files.first().map(|file| file.path.as_str());
 
+                        if let Some(result) = existing_file_result_for_aria2_error(
+                            &target,
+                            gid.clone(),
+                            &error_code,
+                            aria2_file_path,
+                        )? {
+                            info!(
+                                "aria2 返回文件已存在错误码 13，跳过下载并复用本地文件: {}",
+                                result.path.display()
+                            );
+                            on_progress(completed_existing_file_progress(&result));
+                            self.active_downloads.write().remove(&gid);
+                            let _ = self.purge_download_result().await;
+                            return Ok(result);
+                        }
+
+                        on_progress(progress.clone());
                         warn!(
                             "下载失败 [GID: {}], 错误码: {}, 错误信息: {}",
                             gid, error_code, error_msg
@@ -781,7 +943,10 @@ impl Aria2Manager {
                         self.active_downloads.write().remove(&gid);
                         return Err(AppError::Aria2("下载已取消".to_string()));
                     }
-                    _ => continue,
+                    _ => {
+                        on_progress(progress.clone());
+                        continue;
+                    }
                 }
             }
         })
@@ -802,6 +967,14 @@ impl Aria2Manager {
 
     /// 获取下载进度
     pub async fn get_download_progress(&self, gid: &str) -> AppResult<Aria2DownloadProgress> {
+        if let Some(progress) = self.active_downloads.read().get(gid).cloned() {
+            if progress.status == Aria2DownloadStatus::Complete
+                && gid.starts_with(SKIPPED_EXISTING_FILE_GID)
+            {
+                return Ok(progress);
+            }
+        }
+
         let status = self.get_download_status(gid).await?;
 
         let downloaded = status.completed_length;
@@ -1901,6 +2074,132 @@ mod tests {
             extract_filename_from_url("https://example.com/path/to/file.tar.gz?token=abc"),
             "file.tar.gz"
         );
+    }
+
+    #[test]
+    fn test_resolve_download_target_uses_existing_filename_and_save_dir() {
+        let options = Aria2DownloadOptions {
+            save_dir: Some(PathBuf::from("C:/downloads")),
+            filename: Some("artifact.zip".to_string()),
+            use_github_mirror: false,
+            ..Default::default()
+        };
+
+        let target = resolve_download_target("https://example.com/file.zip?token=abc", &options)
+            .expect("解析下载目标失败");
+
+        assert_eq!(target.url, "https://example.com/file.zip?token=abc");
+        assert_eq!(target.filename, "artifact.zip");
+        assert_eq!(
+            target.output_path,
+            PathBuf::from("C:/downloads").join("artifact.zip")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_and_wait_skips_existing_file_without_aria2_rpc() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let output_path = temp_dir.path().join("already.zip");
+        std::fs::write(&output_path, b"existing payload").unwrap();
+
+        let manager = Aria2Manager::new();
+        let options = Aria2DownloadOptions {
+            save_dir: Some(temp_dir.path().to_path_buf()),
+            filename: Some("already.zip".to_string()),
+            overwrite: false,
+            use_github_mirror: false,
+            ..Default::default()
+        };
+        let progress_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_progress_events = progress_events.clone();
+
+        let result = manager
+            .download_and_wait(
+                "https://example.com/already.zip",
+                options,
+                move |progress| {
+                    captured_progress_events.lock().unwrap().push(progress);
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.path, output_path);
+        assert_eq!(result.filename, "already.zip");
+        assert_eq!(result.size, b"existing payload".len() as u64);
+        assert!(result.gid.starts_with(SKIPPED_EXISTING_FILE_GID));
+
+        let events = progress_events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status, Aria2DownloadStatus::Complete);
+        assert_eq!(events[0].percentage, 100.0);
+        assert_eq!(events[0].downloaded, result.size);
+        assert_eq!(events[0].total, result.size);
+    }
+
+    #[test]
+    fn test_existing_file_result_for_aria2_error_code_13_uses_target_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let output_path = temp_dir.path().join("already.zip");
+        std::fs::write(&output_path, b"existing payload").unwrap();
+        let target = ResolvedAria2Download {
+            url: "https://example.com/already.zip".to_string(),
+            output_path: output_path.clone(),
+            filename: "already.zip".to_string(),
+        };
+
+        let result =
+            existing_file_result_for_aria2_error(&target, "gid-13".to_string(), "13", None)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(result.path, output_path);
+        assert_eq!(result.filename, "already.zip");
+        assert_eq!(result.size, b"existing payload".len() as u64);
+        assert_eq!(result.gid, "gid-13");
+    }
+
+    #[test]
+    fn test_existing_file_result_for_aria2_error_code_13_uses_aria2_file_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target_path = temp_dir.path().join("guessed.zip");
+        let aria2_path = temp_dir.path().join("actual.zip");
+        std::fs::write(&aria2_path, b"actual payload").unwrap();
+        let target = ResolvedAria2Download {
+            url: "https://example.com/guessed.zip".to_string(),
+            output_path: target_path,
+            filename: "guessed.zip".to_string(),
+        };
+
+        let result = existing_file_result_for_aria2_error(
+            &target,
+            "gid-13".to_string(),
+            " 13 ",
+            Some(aria2_path.to_str().unwrap()),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(result.path, aria2_path);
+        assert_eq!(result.filename, "actual.zip");
+        assert_eq!(result.size, b"actual payload".len() as u64);
+    }
+
+    #[test]
+    fn test_existing_file_result_for_aria2_error_ignores_other_codes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let output_path = temp_dir.path().join("already.zip");
+        std::fs::write(&output_path, b"existing payload").unwrap();
+        let target = ResolvedAria2Download {
+            url: "https://example.com/already.zip".to_string(),
+            output_path,
+            filename: "already.zip".to_string(),
+        };
+
+        let result =
+            existing_file_result_for_aria2_error(&target, "gid".to_string(), "3", None).unwrap();
+
+        assert!(result.is_none());
     }
 
     #[test]

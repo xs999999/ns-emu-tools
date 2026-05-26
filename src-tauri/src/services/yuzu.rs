@@ -521,20 +521,9 @@ where
     // 使用统一下载接口
     debug!("创建下载任务");
     let download_manager = get_download_manager().await?;
-    let options = if url.contains("github.com") {
-        DownloadOptions {
-            use_github_mirror: true,
-            split: 1,
-            max_connection_per_server: 1,
-            min_split_size: "64M".to_string(),
-            read_timeout: Duration::from_secs(180),
-            ..Default::default()
-        }
-    } else {
-        DownloadOptions {
-            use_github_mirror: false,
-            ..Default::default()
-        }
+    let options = DownloadOptions {
+        use_github_mirror: url.contains("github.com"),
+        ..Default::default()
     };
 
     // 下载并等待完成
