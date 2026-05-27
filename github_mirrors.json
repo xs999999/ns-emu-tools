@@ -9,7 +9,7 @@
     "raw": "https://raw.githubusercontent.com/XIU2/UserScript/master/GithubEnhanced-High-Speed-Download.user.js"
   },
   "counts": {
-    "download": 21,
+    "download": 22,
     "raw": 7
   },
   "download": [
@@ -144,6 +144,13 @@
       "url": "https://gh.zwy.one/https://github.com",
       "region": "美国",
       "description": "[美国 洛杉矶] - 该公益加速源由 [gh.zwy.one] 提供",
+      "source_array": "download_url_us"
+    },
+    {
+      "kind": "download",
+      "url": "https://ghproxy.monkeyray.net/https://github.com",
+      "region": "美国",
+      "description": "[美国 洛杉矶] - 该公益加速源由 [ghproxy.monkeyray.net] 提供",
       "source_array": "download_url_us"
     },
     {
