@@ -118,10 +118,13 @@
         <v-divider style="margin-bottom: 15px"></v-divider>
         <v-row>
           <v-col cols="7">
-            <v-text-field hide-details label="需要安装的 Ryujinx 版本" variant="underlined" v-model="targetRyujinxVersion"></v-text-field>
+            <v-text-field hide-details label="需要安装的 Ryujinx 版本" variant="underlined"
+                          v-model="targetRyujinxVersion" :loading="isLoadingRyujinxVersions"
+                          :disabled="isRunningInstall || isLoadingRyujinxVersions"></v-text-field>
           </v-col>
           <v-col>
             <v-btn color="info" size="large" variant="outlined" min-width="160px"
+                   :disabled="isRunningInstall || isLoadingRyujinxVersions"
                    @click="installRyujinx">
               安装 Ryujinx
             </v-btn>
@@ -213,6 +216,7 @@ let historyPathList = ref<string[]>([])
 let selectedRyujinxPath = ref('')
 let targetRyujinxVersion = ref('')
 let isRunningInstall = ref(false)
+let isLoadingRyujinxVersions = ref(false)
 let platform = ref('')
 let changeLogHtml = ref('<p>加载中...</p>')
 let firmwareWarningMsg = ref(`一般来说，更新固件并不会改善你的游戏体验。只要你的模拟器能够正常识别游戏，并且游戏内的字体显示正常，
@@ -262,8 +266,9 @@ onBeforeMount(async () => {
 })
 
 async function updateRyujinxReleaseInfos() {
+  isLoadingRyujinxVersions.value = true
   allRyujinxReleaseInfos.value = []
-  targetRyujinxVersion.value = ""
+  targetRyujinxVersion.value = "加载中..."
   try {
     const data = await getAllRyujinxVersions(selectedBranch.value)
     if (data.code === 0) {
@@ -272,10 +277,14 @@ async function updateRyujinxReleaseInfos() {
       targetRyujinxVersion.value = infos[0] ?? ''
     } else {
       cds.appendConsoleMessage('ryujinx 版本信息加载异常.')
+      targetRyujinxVersion.value = "加载失败"
     }
   } catch (error) {
     cds.appendConsoleMessage('ryujinx 版本信息加载异常: ' + error)
     console.error('获取 Ryujinx 版本信息失败:', error)
+    targetRyujinxVersion.value = "加载失败"
+  } finally {
+    isLoadingRyujinxVersions.value = false
   }
 }
 

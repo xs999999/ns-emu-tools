@@ -118,11 +118,12 @@
       <v-row>
         <v-col cols="7">
           <v-text-field hide-details :label="`需要安装的 ${selectedEmulatorName} 版本`" v-model="targetYuzuVersion"
-                        :disabled='!isRunningInstall && !isBranchAvailable' variant="underlined"></v-text-field>
+                        :disabled='isRunningInstall || isLoadingYuzuVersions || !isBranchAvailable'
+                        :loading="isLoadingYuzuVersions" variant="underlined"></v-text-field>
         </v-col>
         <v-col>
           <v-btn color="info" size="large" variant="outlined" min-width="140px"
-                 :disabled='!isRunningInstall && !isBranchAvailable'
+                 :disabled='isRunningInstall || isLoadingYuzuVersions || !isBranchAvailable'
                  @click="installYuzuHandler">
             安装 {{ selectedEmulatorName }}
           </v-btn>
@@ -222,6 +223,7 @@ let allYuzuReleaseVersions = ref<string[]>([])
 let targetYuzuVersion = ref('项目已被关闭')
 let isRunningInstall = ref(false)
 let isBranchAvailable = ref(false)
+let isLoadingYuzuVersions = ref(false)
 let historyPathList = ref<string[]>([])
 let selectedYuzuPath = ref('')
 let changeLogHtml = ref('<p>加载中...</p>')
@@ -354,8 +356,9 @@ async function updateYuzuReleaseVersions() {
     return
   }
   isBranchAvailable.value = true
+  isLoadingYuzuVersions.value = true
   allYuzuReleaseVersions.value = []
-  targetYuzuVersion.value = ""
+  targetYuzuVersion.value = "加载中..."
 
   try {
     const response = await getAllYuzuVersions(selectedBranch.value)
@@ -368,9 +371,13 @@ async function updateYuzuReleaseVersions() {
       const message = 'yuzu 版本信息加载异常.'
       consoleDialogStore.appendConsoleMessage(message)
       showNotice('error', message)
+      targetYuzuVersion.value = "加载失败"
     }
   } catch (error) {
     consoleDialogStore.appendConsoleMessage(`加载版本失败: ${error}`)
+    targetYuzuVersion.value = "加载失败"
+  } finally {
+    isLoadingYuzuVersions.value = false
   }
 }
 
@@ -379,6 +386,7 @@ function handleSelectedBranchUpdate() {
     allYuzuReleaseVersions.value = []
     targetYuzuVersion.value = "项目已被关闭"
     isBranchAvailable.value = false
+    isLoadingYuzuVersions.value = false
     return
   } else {
     isBranchAvailable.value = true
