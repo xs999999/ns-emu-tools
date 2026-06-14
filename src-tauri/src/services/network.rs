@@ -1273,6 +1273,135 @@ fn get_override_url(origin_url: &str) -> String {
     origin_url.to_string()
 }
 
+fn summarize_http_error_body(body: &str) -> String {
+    let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return "empty response body".to_string();
+    }
+
+    const MAX_LEN: usize = 200;
+    let mut summary = compact.chars().take(MAX_LEN).collect::<String>();
+    if compact.chars().count() > MAX_LEN {
+        summary.push_str("...");
+    }
+    summary
+}
+
+async fn fetch_github_api_json_with_client(
+    client: &ClientWithMiddleware,
+    request_url: &str,
+    source_name: &str,
+) -> AppResult<serde_json::Value> {
+    let resp = client
+        .get(request_url)
+        .send()
+        .await
+        .map_err(|e| AppError::Network(format!("GitHub API {}请求失败: {}", source_name, e)))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("读取响应体失败: {}", e));
+        return Err(AppError::Network(format!(
+            "GitHub API {}返回 HTTP {}: {}",
+            source_name,
+            status,
+            summarize_http_error_body(&body)
+        )));
+    }
+
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| AppError::Network(format!("解析 GitHub API {}响应失败: {}", source_name, e)))
+}
+
+async fn fetch_github_api_with_fallback(
+    cdn_client: &ClientWithMiddleware,
+    official_client: &ClientWithMiddleware,
+    cdn_url: &str,
+    official_url: &str,
+) -> AppResult<serde_json::Value> {
+    match fetch_github_api_json_with_client(cdn_client, cdn_url, "CDN 源").await {
+        Ok(data) => {
+            debug!("CDN GitHub API 响应成功");
+            Ok(data)
+        }
+        Err(cdn_error) => {
+            warn!(
+                "GitHub API CDN 请求失败，准备回退官方源重试。cdn_url: {}，failure: {}",
+                cdn_url, cdn_error
+            );
+            info!("GitHub API CDN 回退到官方源重试: {}", official_url);
+
+            match fetch_github_api_json_with_client(official_client, official_url, "官方源").await
+            {
+                Ok(data) => {
+                    info!("GitHub API 官方源回退成功: {}", official_url);
+                    Ok(data)
+                }
+                Err(official_error) => {
+                    warn!(
+                        "GitHub API 官方源回退失败。url: {}，failure: {}",
+                        official_url, official_error
+                    );
+                    Err(AppError::Network(format!(
+                        "GitHub API CDN 请求失败后回退官方源仍失败。cdn_error: {}；official_error: {}",
+                        cdn_error, official_error
+                    )))
+                }
+            }
+        }
+    }
+}
+
+async fn fetch_git_api_with_fallback(
+    client: &Client,
+    request_url: &str,
+    fallback_url: &str,
+    request_source_name: &str,
+    fallback_source_name: &str,
+) -> AppResult<serde_json::Value> {
+    match fetch_git_api_json(client, request_url).await {
+        Ok(Some(data)) => Ok(data),
+        Ok(None) => {
+            warn!(
+                "Git API {}返回了网页验证，准备回退{}重试。request_url: {}",
+                request_source_name, fallback_source_name, request_url
+            );
+            fetch_git_api_json(client, fallback_url)
+                .await?
+                .ok_or_else(|| {
+                    AppError::Network(format!(
+                        "Git API {}返回网页验证，回退{}后仍返回网页验证: {}",
+                        request_source_name, fallback_source_name, fallback_url
+                    ))
+                })
+        }
+        Err(request_error) => {
+            warn!(
+                "Git API {}请求失败，准备回退{}重试。request_url: {}，failure: {}",
+                request_source_name, fallback_source_name, request_url, request_error
+            );
+            fetch_git_api_json(client, fallback_url)
+                .await
+                .map_err(|fallback_error| {
+                    AppError::Network(format!(
+                        "Git API {}请求失败后回退{}仍失败。request_error: {}；fallback_error: {}",
+                        request_source_name, fallback_source_name, request_error, fallback_error
+                    ))
+                })?
+                .ok_or_else(|| {
+                    AppError::Network(format!(
+                        "Git API {}请求失败后回退{}返回网页验证: {}",
+                        request_source_name, fallback_source_name, fallback_url
+                    ))
+                })
+        }
+    }
+}
+
 /// 请求 GitHub API
 pub async fn request_github_api(url: &str) -> AppResult<serde_json::Value> {
     info!("请求 GitHub API: {}", url);
@@ -1356,29 +1485,8 @@ pub async fn request_github_api(url: &str) -> AppResult<serde_json::Value> {
     let cdn_url = get_override_url(url);
     info!("使用 CDN 请求 GitHub API: {}", cdn_url);
     let durable_cached_client = get_durable_cached_client();
-    let resp = durable_cached_client
-        .get(&cdn_url)
-        .send()
-        .await
-        .map_err(|e| {
-            warn!("CDN 请求失败: {}", e);
-            AppError::Network(format!("GitHub API CDN 请求失败: {}", e))
-        })?;
-    let status = resp.status();
-    debug!("CDN 请求成功，HTTP 状态: {}", status);
-    if !status.is_success() {
-        warn!("GitHub API CDN 请求失败，HTTP 状态: {}", status);
-        return Err(AppError::Network(format!(
-            "GitHub API CDN 请求失败: {} - {}",
-            status, cdn_url
-        )));
-    }
-    let data = resp.json::<serde_json::Value>().await.map_err(|e| {
-        warn!("解析 CDN 响应失败: {}", e);
-        AppError::Network(format!("解析 GitHub API CDN 响应失败: {}", e))
-    })?;
-    debug!("CDN GitHub API 响应成功");
-    Ok(data)
+    let cached_client = get_cached_client();
+    fetch_github_api_with_fallback(durable_cached_client, cached_client, &cdn_url, url).await
 }
 
 /// 请求 Git 托管平台 API（GitLab/Forgejo）
@@ -1401,24 +1509,29 @@ pub async fn request_git_api(url: &str) -> AppResult<serde_json::Value> {
     let client = create_client()?;
     let final_url = get_final_url(url);
     let cdn_url = get_override_url(url);
-    let data = match fetch_git_api_json(&client, &final_url).await? {
-        Some(data) => data,
-        None if cdn_url != final_url => {
-            warn!(
-                "Git API 直连返回了网页验证，回退到 CDN: {} -> {}",
-                final_url, cdn_url
-            );
-            fetch_git_api_json(&client, &cdn_url)
-                .await?
-                .ok_or_else(|| {
-                    AppError::Network(format!("Git API CDN 仍返回网页验证: {}", cdn_url))
-                })?
-        }
-        None => {
-            return Err(AppError::Network(format!(
-                "Git API 返回了网页验证而非 JSON: {}",
-                final_url
-            )));
+    let is_using_cdn_source = final_url != url;
+    let data = if is_using_cdn_source {
+        fetch_git_api_with_fallback(&client, &final_url, url, "CDN 源", "官方源").await?
+    } else {
+        match fetch_git_api_json(&client, &final_url).await? {
+            Some(data) => data,
+            None if cdn_url != final_url => {
+                warn!(
+                    "Git API 直连返回了网页验证，回退到 CDN: {} -> {}",
+                    final_url, cdn_url
+                );
+                fetch_git_api_json(&client, &cdn_url)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::Network(format!("Git API CDN 仍返回网页验证: {}", cdn_url))
+                    })?
+            }
+            None => {
+                return Err(AppError::Network(format!(
+                    "Git API 返回了网页验证而非 JSON: {}",
+                    final_url
+                )));
+            }
         }
     };
 
@@ -1502,6 +1615,8 @@ pub fn get_available_port() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn test_github_mirror_list() {
@@ -1574,6 +1689,158 @@ mod tests {
             get_override_url(eden_url),
             "https://nsa2.e6ex.com/eden_official/api/v1/repos/eden-emu/eden/releases"
         );
+    }
+
+    #[test]
+    fn test_summarize_http_error_body_compacts_and_truncates() {
+        let summary = summarize_http_error_body(
+            "  too   many\nspaces  and a very long response body that should be truncated once it exceeds the configured limit ".repeat(4).as_str(),
+        );
+
+        assert!(summary.starts_with("too many spaces and a very long response body"));
+        assert!(summary.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_github_api_with_fallback_uses_official_after_cdn_http_error() {
+        let cdn_server = MockServer::start().await;
+        let official_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/releases"))
+            .respond_with(
+                ResponseTemplate::new(502).set_body_string("cdn upstream connect timeout"),
+            )
+            .mount(&cdn_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "source": "official"
+            })))
+            .mount(&official_server)
+            .await;
+
+        let cdn_client = create_cached_client().expect("cdn client");
+        let official_client = create_cached_client().expect("official client");
+
+        let data = fetch_github_api_with_fallback(
+            &cdn_client,
+            &official_client,
+            &format!("{}/releases", cdn_server.uri()),
+            &format!("{}/releases", official_server.uri()),
+        )
+        .await
+        .expect("expected official fallback to succeed");
+
+        assert_eq!(data["ok"], true);
+        assert_eq!(data["source"], "official");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_github_api_with_fallback_reports_both_errors() {
+        let cdn_server = MockServer::start().await;
+        let official_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/releases"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("cdn unavailable"))
+            .mount(&cdn_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/releases"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("official unavailable"))
+            .mount(&official_server)
+            .await;
+
+        let cdn_client = create_cached_client().expect("cdn client");
+        let official_client = create_cached_client().expect("official client");
+
+        let error = fetch_github_api_with_fallback(
+            &cdn_client,
+            &official_client,
+            &format!("{}/releases", cdn_server.uri()),
+            &format!("{}/releases", official_server.uri()),
+        )
+        .await
+        .expect_err("expected fallback failure");
+
+        let message = error.to_string();
+        assert!(message.contains("cdn_error"));
+        assert!(message.contains("official_error"));
+        assert!(message.contains("HTTP 503"));
+        assert!(message.contains("HTTP 500"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_git_api_with_fallback_uses_official_after_cdn_http_error() {
+        let cdn_server = MockServer::start().await;
+        let official_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/releases"))
+            .respond_with(ResponseTemplate::new(504).set_body_string("cdn gateway timeout"))
+            .mount(&cdn_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tag_name": "v1.0.0"
+            })))
+            .mount(&official_server)
+            .await;
+
+        let client = reqwest::Client::builder().build().expect("client");
+        let data = fetch_git_api_with_fallback(
+            &client,
+            &format!("{}/releases", cdn_server.uri()),
+            &format!("{}/releases", official_server.uri()),
+            "CDN 源",
+            "官方源",
+        )
+        .await
+        .expect("expected official fallback to succeed");
+
+        assert_eq!(data["tag_name"], "v1.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_git_api_with_fallback_reports_both_errors() {
+        let cdn_server = MockServer::start().await;
+        let official_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/releases"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("cdn bad gateway"))
+            .mount(&cdn_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/releases"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("official unavailable"))
+            .mount(&official_server)
+            .await;
+
+        let client = reqwest::Client::builder().build().expect("client");
+        let error = fetch_git_api_with_fallback(
+            &client,
+            &format!("{}/releases", cdn_server.uri()),
+            &format!("{}/releases", official_server.uri()),
+            "CDN 源",
+            "官方源",
+        )
+        .await
+        .expect_err("expected fallback failure");
+
+        let message = error.to_string();
+        assert!(message.contains("request_error"));
+        assert!(message.contains("fallback_error"));
+        assert!(message.contains("502 Bad Gateway"));
+        assert!(message.contains("503 Service Unavailable"));
     }
 
     #[test]
