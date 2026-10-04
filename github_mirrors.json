@@ -9,7 +9,7 @@
     "raw": "https://raw.githubusercontent.com/XIU2/UserScript/master/GithubEnhanced-High-Speed-Download.user.js"
   },
   "counts": {
-    "download": 19,
+    "download": 17,
     "raw": 6
   },
   "download": [
@@ -53,13 +53,6 @@
       "url": "https://ghproxy.it/https://github.com",
       "region": "美国",
       "description": "[美国 洛杉矶] - 该公益加速源由 [@yionchilau] 提供",
-      "source_array": "download_url_us"
-    },
-    {
-      "kind": "download",
-      "url": "https://gh.jasonzeng.dev/https://github.com",
-      "region": "美国",
-      "description": "[美国 Cloudflare CDN] - 该公益加速源由 [gh.jasonzeng.dev] 提供",
       "source_array": "download_url_us"
     },
     {
@@ -116,13 +109,6 @@
       "url": "https://gh.zwy.one/https://github.com",
       "region": "美国",
       "description": "[美国 洛杉矶] - 该公益加速源由 [gh.zwy.one] 提供",
-      "source_array": "download_url_us"
-    },
-    {
-      "kind": "download",
-      "url": "https://ghproxy.monkeyray.net/https://github.com",
-      "region": "美国",
-      "description": "[美国 洛杉矶] - 该公益加速源由 [ghproxy.monkeyray.net] 提供",
       "source_array": "download_url_us"
     },
     {
