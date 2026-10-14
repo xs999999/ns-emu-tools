@@ -9,7 +9,7 @@
     "raw": "https://raw.githubusercontent.com/XIU2/UserScript/master/GithubEnhanced-High-Speed-Download.user.js"
   },
   "counts": {
-    "download": 14,
+    "download": 15,
     "raw": 6
   },
   "download": [
@@ -74,6 +74,13 @@
       "url": "https://cdn.crashmc.com/https://github.com",
       "region": "美国",
       "description": "[美国 Cloudflare CDN] - 该公益加速源由 [cdn.crashmc.com] 提供",
+      "source_array": "download_url_us"
+    },
+    {
+      "kind": "download",
+      "url": "https://git.yylx.win/https://github.com",
+      "region": "美国",
+      "description": "[美国 Cloudflare CDN] - 该公益加速源由 [git.yylx.win] 提供",
       "source_array": "download_url_us"
     },
     {
